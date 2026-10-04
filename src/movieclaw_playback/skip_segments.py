@@ -79,7 +79,8 @@ HEAD_ZONE_S = 60.0
 #: 开头区以外的短段必须离一个已接受的长段多近（秒）：片头后紧跟的冠名广告
 ADJACENT_S = 3.0
 #: 算法版本：改了上面任何规则就加一，服务端据此把旧结果全部重算一遍
-ALGO_VERSION = 6
+#: （7：候选位移按升序遍历，等长共享段的取舍确定下来）
+ALGO_VERSION = 7
 
 _POPCOUNT8 = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
 
@@ -172,25 +173,52 @@ def _contiguous(
     return regions
 
 
-def _candidate_shifts(lhs: np.ndarray, rhs: np.ndarray) -> set[int]:
-    """哈希值相同（±SHIFT_TOLERANCE）的帧对给出的全部候选位移。"""
-    # 同一哈希值出现多次时取最后一次（与 intro-skipper 的倒排写法一致）
-    left = {value: i for i, value in enumerate(lhs.tolist())}
-    right = {value: i for i, value in enumerate(rhs.tolist())}
+#: 一个窗口的倒排索引：(升序的唯一哈希值, 每个值最后一次出现的帧号)
+ValueIndex = tuple[np.ndarray, np.ndarray]
+
+
+def _value_index(hashes: np.ndarray) -> ValueIndex:
+    """每个哈希值最后一次出现的帧号，按值升序。
+
+    重复值取最后一次，与 intro-skipper 的倒排写法一致。
+    """
+    values, first_in_reversed = np.unique(hashes[::-1], return_index=True)
+    return values, (len(hashes) - 1 - first_in_reversed).astype(np.int64)
+
+
+def _candidate_shifts(left: ValueIndex, right: ValueIndex) -> list[int]:
+    """哈希值相同（±SHIFT_TOLERANCE）的帧对给出的全部候选位移，升序。
+
+    两侧都是升序唯一值，按容差平移后求交集，全程向量化。逐帧查 Python 字典的旧写法
+    占了整季比对 87% 的时间（同一集的窗口在 24 次配对里还要反复建字典），全库实测
+    改写后快 3.4 倍，候选位移集合与旧写法完全相同。
+    """
+    lv, li = left
+    rv, ri = right
     shifts: set[int] = set()
-    for value, i in left.items():
-        for delta in range(-SHIFT_TOLERANCE, SHIFT_TOLERANCE + 1):
-            j = right.get((value + delta) & 0xFFFFFFFF)
-            if j is not None:
-                shifts.add(j - i)
-    return shifts
+    for delta in range(-SHIFT_TOLERANCE, SHIFT_TOLERANCE + 1):
+        moved = ((lv.astype(np.int64) + delta) & 0xFFFFFFFF).astype(np.uint32)
+        # 平移可能在 0 / 2^32 处回绕，打乱升序；唯一性不变
+        order = np.argsort(moved, kind="stable")
+        _, a, b = np.intersect1d(moved[order], rv, assume_unique=True, return_indices=True)
+        shifts.update((ri[b] - li[order][a]).tolist())
+    return sorted(shifts)
 
 
 def shared_regions(
-    lhs: np.ndarray, rhs: np.ndarray, min_s: float = MIN_SEGMENT_S
+    lhs: np.ndarray,
+    rhs: np.ndarray,
+    min_s: float = MIN_SEGMENT_S,
+    indexes: tuple[ValueIndex, ValueIndex] | None = None,
 ) -> list[tuple[int, int, int, int]]:
-    """两段指纹之间互不重叠的、至少 ``min_s`` 秒的全部共享段（帧号），长的优先。"""
-    found = [r for s in _candidate_shifts(lhs, rhs) for r in _contiguous(lhs, rhs, s, min_s)]
+    """两段指纹之间互不重叠的、至少 ``min_s`` 秒的全部共享段（帧号），长的优先。
+
+    ``indexes``：两侧窗口的倒排索引（整季比对时每个窗口只建一次）；不给就现建。
+    候选位移按升序遍历，等长共享段的取舍才是确定的：按集合遍历顺序时，同样的输入
+    换一种建集合的顺序，全库有 1045 集边界变化（大多 1 帧，最大 31 秒）。
+    """
+    left, right = indexes if indexes is not None else (_value_index(lhs), _value_index(rhs))
+    found = [r for s in _candidate_shifts(left, right) for r in _contiguous(lhs, rhs, s, min_s)]
     found.sort(key=lambda r: -(r[1] - r[0]))
     kept: list[tuple[int, int, int, int]] = []
     for r in found:
@@ -224,6 +252,14 @@ class _Season:
     def __init__(self, episodes: Sequence[Episode]):
         self.episodes = list(episodes)
         self._pairs: dict[tuple[int, int, str], list[tuple[tuple[float, float], float]]] = {}
+        self._indexes: dict[tuple[int, str], ValueIndex] = {}
+
+    def _index(self, episode: Episode, mode: str) -> ValueIndex:
+        """窗口的倒排索引：每集每个窗口只建一次，供它参与的全部配对复用。"""
+        key = (episode.file_id, mode)
+        if key not in self._indexes:
+            self._indexes[key] = _value_index(episode.windows[mode].hashes)
+        return self._indexes[key]
 
     def pair(self, a: Episode, b: Episode, mode: str) -> list[tuple[tuple[float, float], float]]:
         """a 上与 b 共享的段（文件秒数）及对齐质量。"""
@@ -238,7 +274,8 @@ class _Season:
         theirs: list[tuple[tuple[float, float], float]] = []
         # 片头窗放宽到短段（厂标、许可证、冠名广告），由 raw_segments 再加约束；片尾窗不变
         min_s = SHORT_SEGMENT_S if mode == "intro" else MIN_SEGMENT_S
-        for region in shared_regions(wa.hashes, wb.hashes, min_s):
+        indexes = (self._index(a, mode), self._index(b, mode))
+        for region in shared_regions(wa.hashes, wb.hashes, min_s, indexes):
             sa, ea = region[0] * HASH_SECONDS, region[1] * HASH_SECONDS
             if ea - sa > MAX_SEGMENT_S[mode]:
                 continue

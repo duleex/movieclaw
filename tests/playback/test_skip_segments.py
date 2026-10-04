@@ -197,6 +197,36 @@ def test_short_ad_right_after_intro_merges_but_far_one_does_not() -> None:
         assert abs(seg.start - 100) < 1.5 and abs(seg.end - 191) < 1.5
 
 
+def _reference_shifts(lhs: np.ndarray, rhs: np.ndarray) -> set[int]:
+    """v6 及以前逐帧查字典的写法，作为向量化实现的对照。"""
+    left = {value: i for i, value in enumerate(lhs.tolist())}
+    right = {value: i for i, value in enumerate(rhs.tolist())}
+    shifts = set()
+    for value, i in left.items():
+        for delta in range(-K.SHIFT_TOLERANCE, K.SHIFT_TOLERANCE + 1):
+            j = right.get((value + delta) & 0xFFFFFFFF)
+            if j is not None:
+                shifts.add(j - i)
+    return shifts
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_vectorized_candidate_shifts_match_reference(seed) -> None:
+    """向量化求交与逐帧查字典给出同一组候选位移：含重复值、相邻值和 0 / 2^32 回绕。"""
+    rng = np.random.default_rng(100 + seed)
+    pool = np.concatenate(
+        [
+            rng.integers(0, 2**32, size=300, dtype=np.uint64),
+            np.array([0, 1, 2, 2**32 - 2, 2**32 - 1], dtype=np.uint64),
+        ]
+    ).astype(np.uint32)
+    lhs = rng.choice(pool, size=800)
+    rhs = rng.choice(pool, size=900)
+    rhs[100:300] = lhs[400:600] + rng.integers(-2, 3, size=200).astype(np.uint32)
+    got = K._candidate_shifts(K._value_index(lhs), K._value_index(rhs))
+    assert got == sorted(_reference_shifts(lhs, rhs))
+
+
 def test_other_versions_of_same_episode_are_not_partners() -> None:
     """同一集的两个版本处处一样：不能当伙伴，否则整段正片都会被认成「重复」。"""
     rng = np.random.default_rng(6)
