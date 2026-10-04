@@ -40,6 +40,7 @@ from movieclaw_db.models import (
 from movieclaw_db.repositories.library_repo import LibraryRepository
 from movieclaw_jellyfin.ids import episode_guid
 from movieclaw_playback import activity
+from movieclaw_playback import credits as credits_logic
 from movieclaw_playback.events import ClientInfo
 from movieclaw_playback.skip_segments import HASH_SECONDS
 
@@ -158,6 +159,8 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("SECRET_KEY_FILE", str(tmp_path / ".secret_key"))
     monkeypatch.setenv("MOVIECLAW_TRANSCODE_DIR", str(tmp_path / "transcodes"))
     monkeypatch.setenv("MOVIECLAW_AUDIO_FINGERPRINT_DIR", str(tmp_path / "fp"))
+    # 默认不加载画面文字识别模型（开发机 data/models/ppocr 里有也不用），结果只来自声音
+    monkeypatch.setenv("MOVIECLAW_OCR_DIR", str(tmp_path / "no-ocr-models"))
     monkeypatch.setenv("SCHEDULER_ENABLED", "false")
     monkeypatch.setenv("TMDB_API_KEY", "test-key-not-used")
     get_settings.cache_clear()
@@ -1456,3 +1459,84 @@ def test_truncated_fingerprint_is_rebuilt_in_library_job(client, tmp_path, monke
     assert path.read_bytes() == good
     assert call(client, _states)[victim].segments
     assert call(client, _needing) == []
+
+
+# ---------------------------------------------------------------------------
+# 画面证据：用片尾演职员表修正片尾
+# ---------------------------------------------------------------------------
+
+
+def test_credits_refinement_rewrites_outro_in_database(client, tmp_path, monkeypatch) -> None:
+    """整季识别后按画面修正片尾：改写的区间落库，其余集保持声音结果。"""
+    ids = call(client, _seed, tmp_path)
+    first = ids["files"][0]
+    seen: list[tuple[float, float] | None] = []
+
+    async def fake_refine(outro, duration, observe):
+        seen.append(outro)
+        if len(seen) == 1:
+            return credits_logic.OutroDecision((2600.0, 2650.0), "测试：演职员表后回到剧情")
+        return credits_logic.OutroDecision(outro, "演职员表确认")
+
+    monkeypatch.setattr(skip_segments, "_ocr_engine", lambda: object())
+    monkeypatch.setattr(skip_segments.credits_logic, "refine_outro", fake_refine)
+    call(client, skip_segments.analyze_season, ids["show"], 1)
+    states = call(client, _states)
+    outro = next(s for s in states[first].segments if s["type"] == "outro")
+    assert (outro["start_ms"], outro["end_ms"], outro["to_end"]) == (2_600_000, 2_650_000, False)
+    other = next(s for s in states[ids["files"][1]].segments if s["type"] == "outro")
+    assert other["to_end"] and other["end_ms"] > 2_690_000
+    assert len(seen) == len(ids["files"]) and all(o is not None for o in seen)
+
+
+def test_frame_check_failure_keeps_audio_result(client, tmp_path, monkeypatch) -> None:
+    """抽帧或 OCR 出错只影响这一集的画面核对，声音识别的片尾照常落库。"""
+    ids = call(client, _seed, tmp_path)
+
+    async def broken_refine(outro, duration, observe):
+        raise RuntimeError("onnxruntime 推理失败")
+
+    monkeypatch.setattr(skip_segments, "_ocr_engine", lambda: object())
+    monkeypatch.setattr(skip_segments.credits_logic, "refine_outro", broken_refine)
+    call(client, skip_segments.analyze_season, ids["show"], 1)
+    states = call(client, _states)
+    assert all(any(s["type"] == "outro" for s in states[f].segments) for f in ids["files"])
+
+
+def test_frame_probe_caches_observations(client, tmp_path, monkeypatch) -> None:
+    """同一时间点不重复抽帧：关键帧 ±1.5 秒复用，要精确帧时不拿关键帧顶替；片源换了缓存作废。"""
+    from types import SimpleNamespace
+
+    from movieclaw_playback.ocr import TextLine
+
+    grabs: list[tuple[float, bool]] = []
+
+    async def fake_grab(path, t, accurate):
+        grabs.append((t, accurate))
+        # 只解关键帧时拿到的是请求点之后的关键帧：实际时间晚 0.8 秒
+        return np.zeros((54, 96, 3), dtype=np.uint8), t if accurate else t + 0.8
+
+    class Engine:
+        def read(self, img):
+            return [TextLine("Directed by", 0.95, (0.4, 0.4, 0.6, 0.45))]
+
+    monkeypatch.setattr(skip_segments, "_grab_frame", fake_grab)
+    file = SimpleNamespace(id=7, file_path=str(tmp_path / "x.mkv"), size_bytes=123)
+
+    async def scenario() -> None:
+        probe = skip_segments._FrameProbe(file, Engine())
+        frame = await probe.observe(100.0, False)
+        assert frame is not None and frame.keyword and frame.dark
+        assert frame.t == 100.8  # 帧按实际时间记，不按请求时间
+        await probe.observe(101.0, False)
+        await probe.observe(101.0, True)
+        probe.save()
+        again = skip_segments._FrameProbe(file, Engine())
+        await again.observe(100.4, False)
+        await again.observe(101.1, True)
+        file.size_bytes = 456
+        replaced = skip_segments._FrameProbe(file, Engine())
+        await replaced.observe(100.0, False)
+
+    client.portal.call(scenario)  # type: ignore[attr-defined]
+    assert grabs == [(100.0, False), (101.0, True), (100.0, False)]
