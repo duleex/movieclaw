@@ -2706,6 +2706,9 @@ async def _fill_from_tmdb_season(
 ) -> None:
     """TMDB 分季详情兜底：只填空缺字段，绝不覆盖本地刮削成果。失败静默
     （分集区退化为无剧照/无简介，不阻断）。"""
+    # NFO-only 剧集缺少分集资料时保留空字段，不以 TMDB 补齐。
+    if item.source != "tmdb":
+        return
     from movieclaw_api.services.media_discover import get_tmdb_client
 
     # 语言按条目的刮削归属库（设计文档 §14）——缓存键必须带上它，否则动漫库
@@ -2797,6 +2800,9 @@ async def _tmdb_fallback_meta(session: AsyncSession, item: MediaItem) -> EntryMe
     "本地未刮削"提示，不阻断详情）。结果标记 ``source="tmdb"``，前端据此
     注明信息来自 TMDB 而非本地刮削。
     """
+    # local 来源明确不允许联网兜底。
+    if item.source != "tmdb":
+        return None
     from movieclaw_api.services.media_discover import get_tmdb_client
     from movieclaw_media.models import MediaKind as _Kind
 
