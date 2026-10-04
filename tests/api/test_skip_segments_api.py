@@ -71,6 +71,46 @@ def test_incomplete_audio_does_not_switch_without_suitable_alternative(reason: s
     assert skip_segments._complete_audio_index(streams, 2700) == 0
 
 
+def _truehd_streams() -> list[dict]:
+    return [
+        {"codec_name": "truehd", "duration": "2700", "tags": {"language": "eng"}},
+        {"codec_name": "ac3", "duration": "2700", "tags": {"language": "eng"}},
+    ]
+
+
+def test_truehd_is_replaced_by_same_mix_lossy_track() -> None:
+    """《黄石》这类原盘 Remux：TrueHD 解码是同片 AC3 兼容轨的 4 倍，改用 AC3 算指纹。"""
+    assert skip_segments._cheaper_audio_index(_truehd_streams(), 0, 2700) == 1
+    # 第一轨短缺换到第二轨（TrueHD）后，同样再换到完整的有损轨
+    streams = [{"codec_name": "aac", "duration": "2400", "tags": {"language": "eng"}}]
+    streams += _truehd_streams()
+    assert skip_segments._complete_audio_index(streams, 2700) == 1
+    assert skip_segments._cheaper_audio_index(streams, 1, 2700) == 2
+
+
+@pytest.mark.parametrize("reason", ["commentary", "different_language", "short", "unknown_length"])
+def test_truehd_kept_without_equivalent_lossy_track(reason: str) -> None:
+    streams = _truehd_streams()
+    if reason == "commentary":
+        streams[1]["disposition"] = {"comment": 1}
+    elif reason == "different_language":
+        streams[1]["tags"]["language"] = "spa"
+    elif reason == "short":
+        streams[1]["duration"] = "2600"
+    else:
+        streams[1]["duration"] = "N/A"
+    assert skip_segments._cheaper_audio_index(streams, 0, 2700) == 0
+
+
+def test_cheap_codecs_are_never_switched() -> None:
+    """EAC3 / AAC / DTS / FLAC 解码都很快：选中的轨不是 TrueHD 就不动。"""
+    streams = [
+        {"codec_name": "eac3", "duration": "2700", "tags": {"language": "eng"}},
+        {"codec_name": "aac", "duration": "2700", "tags": {"language": "eng"}},
+    ]
+    assert skip_segments._cheaper_audio_index(streams, 0, 2700) == 0
+
+
 _ADMIN = {"username": "admin", "password": "Sup3rSecret!"}
 CAPABILITY = {
     "video": [{"codec": "h264"}],

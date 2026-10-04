@@ -391,6 +391,32 @@ class FingerprintError(Exception):
     """算不了指纹（中文原因直接给用户看）。"""
 
 
+def _stream_length(stream: dict) -> float | None:
+    """ffprobe 给的音轨时长（秒）：优先 duration，其次 MKV 的 DURATION 标签；拿不到返回 None。"""
+    for value in (stream.get("duration"), (stream.get("tags") or {}).get("DURATION")):
+        try:
+            parts = [float(x) for x in str(value).split(":")]
+            seconds = (
+                parts[0]
+                if len(parts) == 1
+                else sum(x * weight for x, weight in zip(parts, (3600, 60, 1), strict=True))
+            )
+            if math.isfinite(seconds) and seconds > 0:
+                return seconds
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _same_content_track(stream: dict, language: str | None) -> bool:
+    """能代替选中轨的同一份混音：同语言（或语言未知）、不是解说轨 / 口述影像轨。"""
+    disposition = stream.get("disposition") or {}
+    if disposition.get("comment") or disposition.get("visual_impaired"):
+        return False
+    other = (stream.get("tags") or {}).get("language")
+    return language in (None, "und") or other in (None, "und", language)
+
+
 def _complete_audio_index(streams: list[dict], duration: float) -> int:
     """第一条音轨明显短缺时，选同语言、完整的普通音轨；信息不足则维持第一条。
 
@@ -398,22 +424,7 @@ def _complete_audio_index(streams: list[dict], duration: float) -> int:
     才覆盖本集。不能只凭 codec/默认标记选择（这两条都标了默认），也不能把解说轨
     或其他语言的音轨当作修复。5 秒容差保留正常的收尾静音、容器时长舍入差异。
     """
-
-    def length(stream: dict) -> float | None:
-        for value in (stream.get("duration"), (stream.get("tags") or {}).get("DURATION")):
-            try:
-                parts = [float(x) for x in str(value).split(":")]
-                seconds = (
-                    parts[0]
-                    if len(parts) == 1
-                    else sum(x * weight for x, weight in zip(parts, (3600, 60, 1), strict=True))
-                )
-                if math.isfinite(seconds) and seconds > 0:
-                    return seconds
-            except (ValueError, TypeError):
-                continue
-        return None
-
+    length = _stream_length
     if not streams or duration <= 0:
         return 0
     first_length = length(streams[0])
@@ -421,16 +432,40 @@ def _complete_audio_index(streams: list[dict], duration: float) -> int:
         return 0
     language = (streams[0].get("tags") or {}).get("language")
     for index, stream in enumerate(streams[1:], 1):
-        disposition = stream.get("disposition") or {}
-        other_language = (stream.get("tags") or {}).get("language")
-        if disposition.get("comment") or disposition.get("visual_impaired"):
-            continue
-        if language not in (None, "und") and other_language not in (None, "und", language):
+        if not _same_content_track(stream, language):
             continue
         track_length = length(stream)
         if track_length is not None and abs(track_length - duration) <= 5:
             return index
     return 0
+
+
+#: 解码开销大的无损编码。NAS 实测解两分钟音频：TrueHD 7.1 要 2.6 秒，同片的 AC3 备选轨
+#: 0.63 秒；DTS / EAC3 / AAC / FLAC 都在 0.24～0.57 秒，不值得换
+_COSTLY_AUDIO_CODECS = frozenset({"truehd", "mlp"})
+
+
+def _cheaper_audio_index(streams: list[dict], index: int, duration: float) -> int:
+    """选中的轨是 TrueHD 时，换同语言、完整的有损轨，省四分之三的解码 CPU。
+
+    原盘 Remux 的 TrueHD 轨通常带一条同混音的 AC3 兼容轨，指纹照样和别的集对得上。
+    时长不明或差 5 秒以上的轨不换：宁可多花解码时间，也不能换到不完整的轨上。
+    """
+    if not 0 <= index < len(streams) or duration <= 0:
+        return index
+    chosen = streams[index]
+    if (chosen.get("codec_name") or "").lower() not in _COSTLY_AUDIO_CODECS:
+        return index
+    language = (chosen.get("tags") or {}).get("language")
+    for other, stream in enumerate(streams):
+        if other == index or (stream.get("codec_name") or "").lower() in _COSTLY_AUDIO_CODECS:
+            continue
+        if not _same_content_track(stream, language):
+            continue
+        track_length = _stream_length(stream)
+        if track_length is not None and abs(track_length - duration) <= 5:
+            return other
+    return index
 
 
 async def _fingerprint_audio_index(file: LibraryFile) -> int:
@@ -444,7 +479,7 @@ async def _fingerprint_audio_index(file: LibraryFile) -> int:
         "-select_streams",
         "a",
         "-show_entries",
-        "stream=duration:stream_tags=DURATION,language:stream_disposition=comment,visual_impaired",
+        "stream=codec_name,duration:stream_tags=DURATION,language:stream_disposition=comment,visual_impaired",
         "-of",
         "json",
         file.file_path,
@@ -476,12 +511,21 @@ async def _fingerprint_audio_index(file: LibraryFile) -> int:
             raise ValueError
     except (ValueError, KeyError, TypeError) as exc:
         raise FingerprintError("音轨探测结果无效，无法选择完整音轨") from exc
-    index = _complete_audio_index(streams, float(file.duration_seconds or 0))
+    duration = float(file.duration_seconds or 0)
+    index = _complete_audio_index(streams, duration)
     if index:
         logger.warning(
             "文件 #%s 的第一条音轨时长不足，改用第 %s 条完整音轨识别片头片尾", file.id, index + 1
         )
-    return index
+    cheaper = _cheaper_audio_index(streams, index, duration)
+    if cheaper != index:
+        logger.info(
+            "文件 #%s 的第 %s 条音轨是 TrueHD，改用同语言的第 %s 条有损音轨算指纹（解码快约 4 倍）",
+            file.id,
+            index + 1,
+            cheaper + 1,
+        )
+    return cheaper
 
 
 async def _chromaprint_window(
