@@ -3529,7 +3529,8 @@ async def _identify_with_fallback(
         spec=spec,
         evidence=evidence,
         is_disc=is_disc,
-        scraped=profile.scraped,
+        # 本地 NFO 电影/剧集仍按作品目录聚合；只有其他/图片库逐文件成项。
+        scraped=profile.naming,
     )
     item = await media_service.ensure_local_item(kind, identity, library_id=library.id)
     return replace(
@@ -3605,7 +3606,7 @@ async def _refresh_local_identity(
         spec=None,
         evidence=None,
         is_disc=False,
-        scraped=profile_of(library).scraped,
+        scraped=profile_of(library).naming,
     )
     if not identity.from_nfo:
         return False
