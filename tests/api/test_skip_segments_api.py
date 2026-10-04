@@ -29,7 +29,14 @@ from movieclaw_api.services.playback.session import get_session_manager, reset_s
 from movieclaw_api.settings.store import reset_setting_store
 from movieclaw_db.crypto import reset_secret_box
 from movieclaw_db.engine import get_database
-from movieclaw_db.models import FileSource, FileState, LibraryFile, MediaItem, MediaSegmentState
+from movieclaw_db.models import (
+    FileSource,
+    FileState,
+    LibraryFile,
+    MediaItem,
+    MediaMetadata,
+    MediaSegmentState,
+)
 from movieclaw_db.repositories.library_repo import LibraryRepository
 from movieclaw_jellyfin.ids import episode_guid
 from movieclaw_playback import activity
@@ -924,11 +931,90 @@ def test_backfill_resorts_after_every_season(
     assert len(done) == 8
 
 
+async def _set_metadata(item_id: int, language: str | None, countries: list[str]) -> None:
+    async with get_database().session() as session:
+        session.add(
+            MediaMetadata(
+                media_item_id=item_id, original_language=language, origin_countries=countries
+            )
+        )
+        await session.commit()
+
+
+async def _set_head_segment(file_id: int, start_ms: int) -> None:
+    async with get_database().session() as session:
+        state = await session.get(MediaSegmentState, file_id)
+        state.segments = [
+            {"type": "other", "start_ms": start_ms, "end_ms": 13_000, "to_end": False},
+            {"type": "intro", "start_ms": 270_000, "end_ms": 370_000, "to_end": False},
+        ]
+        await session.commit()
+
+
+@pytest.mark.parametrize(
+    "language,countries,snapped",
+    [
+        ("cn", ["HK"], True),  # 粤语港剧
+        ("zh", ["TW"], True),
+        ("ja", ["JP"], False),  # 《晚酌的流派》开头几秒就是剧情
+        ("en", ["US"], False),
+        (None, [], False),  # 没刮到元数据：宁可少跳
+    ],
+)
+def test_head_snap_only_for_chinese_titles(
+    client: TestClient, tmp_path: Path, language, countries, snapped
+) -> None:
+    """下发贴零只对中文内容：国内每集先放发行许可证，许可证前只会是广告；海外剧有冷开场。"""
+    ids = call(client, _seed, tmp_path)
+    if language is not None:
+        call(client, _set_metadata, ids["show"], language, countries)
+    call(client, skip_segments.analyze_season, ids["show"], 1)
+    first = ids["files"][0]
+    call(client, _set_head_segment, first, 4_600)
+    served = start_session(client, first)["segments"][0]["start_ms"]
+    assert served == (0 if snapped else 4_600)
+
+
+def test_head_segments_within_snap_window_merge_into_one_button(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """《长安的荔枝》E02：许可证 0–6.6 秒 + 片头 10.4 秒起，中间是腾讯厂标。
+
+    v5 只认出片头，贴零后一个按钮跳完；v6 认出了许可证，不并就拆成两个按钮、厂标漏跳。
+    """
+    ids = call(client, _seed, tmp_path)
+    call(client, _set_metadata, ids["show"], "zh", ["CN"])
+    call(client, skip_segments.analyze_season, ids["show"], 1)
+    first = ids["files"][0]
+
+    async def set_segments() -> None:
+        async with get_database().session() as session:
+            state = await session.get(MediaSegmentState, first)
+            state.segments = [
+                {"type": "other", "start_ms": 0, "end_ms": 6_600, "to_end": False},
+                {"type": "intro", "start_ms": 10_400, "end_ms": 98_000, "to_end": False},
+                {"type": "outro", "start_ms": 2_500_000, "end_ms": 2_600_000, "to_end": True},
+            ]
+            await session.commit()
+
+    call(client, set_segments)
+    served = start_session(client, first)["segments"]
+    assert [(s["type"], s["start_ms"], s["end_ms"]) for s in served] == [
+        ("intro", 0, 98_000),
+        ("outro", 2_500_000, 2_600_000),
+    ]
+    assert len(call(client, _states)[first].segments) == 3  # 库里仍存识别原值
+
+
 def test_first_segment_near_file_start_is_served_from_zero(
     client: TestClient, tmp_path: Path
 ) -> None:
-    """片头前只有几秒台标时，下发的第一段从 0 开始：开播就给「跳过」。库里存的原值不变。"""
+    """中文剧片头前只有几秒台标、冠名广告时，下发的第一段从 0 开始：开播就给「跳过」。
+
+    库里存的原值不变。海外剧常有几秒的剧情冷开场，不贴（见下一个用例）。
+    """
     ids = call(client, _seed, tmp_path)
+    call(client, _set_metadata, ids["show"], "zh", ["CN"])
     call(client, skip_segments.analyze_season, ids["show"], 1)
     first, second = ids["files"][0], ids["files"][1]
 

@@ -99,6 +99,12 @@ _FRESH_S = 45.0
 PRIORITY_BATCH = 6
 #: 第一段片头离文件开头不超过这么多毫秒时，下发给播放器的起点贴到 0（见 ``segments_for_file``）
 _HEAD_SNAP_MS = 15_000
+#: 只对中文内容贴零（原始语言 zh / 粤语 cn，或出品地含中国大陆）。国内每集开头先放发行许可证，
+#: 许可证、厂标之前那几秒只会是每集不同的冠名广告（NAS 国产剧实测 142 个 ≤12 秒的空隙无一剧情）；
+#: 海外剧常有几秒的剧情冷开场（《晚酌的流派》《艺术的力量》），贴零会误跳剧情
+#: （docs/design/skip-intro.md §2.9）
+_HEAD_SNAP_LANGUAGES = frozenset({"zh", "cn"})
+_HEAD_SNAP_COUNTRIES = frozenset({"CN"})
 #: 多少天内看过的季算「正在追」，整库回填优先做（见 ``seasons_needing_work``）
 _WATCHING_WINDOW = timedelta(days=30)
 
@@ -819,7 +825,7 @@ async def analyze_season(
 
 
 async def segments_for_file(session: AsyncSession, file: LibraryFile) -> list[dict[str, Any]]:
-    """播放器要的片段（毫秒）：库开着开关、识别过才有，否则空表。两次主键查询。"""
+    """播放器要的片段（毫秒）：库开着开关、识别过才有，否则空表。两次主键查询（要贴零时再查一次元数据）。"""
     if file.id is None or file.library_id is None:
         return []
     state = await session.get(MediaSegmentState, file.id)
@@ -836,13 +842,40 @@ async def segments_for_file(session: AsyncSession, file: LibraryFile) -> list[di
     if library is None or library.kind != "tv" or not library.detect_media_segments:
         return []
     segments = [dict(s) for s in state.segments]
-    # 片头前那几秒多是平台台标、片名卡，不值得单独看：第一段离开头不到 _HEAD_SNAP_MS 就从 0 算起，
+    # 片头前那几秒多是平台台标、冠名广告，不值得单独看：第一段离开头不到 _HEAD_SNAP_MS 就从 0 算起，
     # 开播就给「跳过」，不必等到冠名广告真正响起才冒出来（用户反馈 2026-10-01）。
-    # 只改下发的区间，库里存的仍是识别原值；跳到的终点不变
-    first = min(segments, key=lambda seg: seg["start_ms"], default=None)
-    if first is not None and 0 < first["start_ms"] <= _HEAD_SNAP_MS:
-        first["start_ms"] = 0
+    # 只改下发的区间，库里存的仍是识别原值；跳到的终点不变。
+    # 只对中文内容（见 _HEAD_SNAP_LANGUAGES）。
+    # 起点都在 _HEAD_SNAP_MS 内的几段（许可证 0–6.6 秒、厂标、片头 10.4 秒起）并成一个按钮，
+    # 从 0 跳到其中最远的终点：v6 认出短段后，不并就会把 v5 的一个按钮拆成两个，中间几秒台标漏跳
+    heads = [s for s in segments if s["type"] != "outro" and s["start_ms"] <= _HEAD_SNAP_MS]
+    if (
+        heads
+        and (len(heads) > 1 or heads[0]["start_ms"] > 0)
+        and file.media_item_id is not None
+        and await _snaps_head_to_zero(session, file.media_item_id)
+    ):
+        merged = {**max(heads, key=lambda s: s["end_ms"]), "start_ms": 0}
+        segments = [merged, *(s for s in segments if not any(s is h for h in heads))]
+        segments.sort(key=lambda s: s["start_ms"])
     return segments
+
+
+async def _snaps_head_to_zero(session: AsyncSession, media_item_id: int) -> bool:
+    """这部剧开头那几秒能不能当广告贴掉：只认中文内容，没刮到元数据的不贴（宁可少跳）。"""
+    row = (
+        await session.execute(
+            select(MediaMetadata.original_language, MediaMetadata.origin_countries).where(
+                MediaMetadata.media_item_id == media_item_id
+            )
+        )
+    ).first()
+    if row is None:
+        return False
+    language, countries = row
+    return (language or "") in _HEAD_SNAP_LANGUAGES or bool(
+        set(countries or []) & _HEAD_SNAP_COUNTRIES
+    )
 
 
 _bump_pending: set[tuple[int, int]] = set()

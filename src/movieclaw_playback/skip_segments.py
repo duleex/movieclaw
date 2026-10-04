@@ -20,7 +20,15 @@
      每个版本只出现在少数几集的季；
    - 对上的伙伴占比 ≥ ``MAJORITY`` 且 ≥2 个——救下配乐安静、指纹噪声大但每集都有
      的片头（《王冠》对齐质量只有 0.22～0.47）。
-4. **整理**：首尾相接的段合并（冠名广告 + 发行许可 + 片头一个按钮跳完）；片头窗里
+4. **片头窗里的短段**（2026-10 国产剧实验，设计文档 §2.9）：国产剧开头常见 6～15 秒的
+   平台厂标、发行许可证、片头后的冠名广告，15 秒门槛认不出。片头窗的共享段放宽到
+   ``SHORT_SEGMENT_S``，但短段只在三重约束下成立，免得把剧情配乐的零碎重复认进来：
+   - 长候选（≥15 秒）只认长匹配的票，判定与放宽前完全一致；
+   - 短候选走「对得很像」这条路时，门槛提到 ``SHORT_GOOD_MATCH``（厂标、许可证各集
+     是同一份音频，剧情配乐有对白和环境声盖着）；
+   - 短候选要么落在文件开头 ``HEAD_ZONE_S`` 秒内，要么紧挨一个已接受的长段
+     （≤ ``ADJACENT_S`` 秒，片头前后的冠名广告）。
+5. **整理**：首尾相接的段合并（冠名广告 + 发行许可 + 片头一个按钮跳完）；片头窗里
    最长的一段是片头，其余是「其他」；片尾窗只认最后一段（片中每集都响一遍的固定
    配乐场景不当片尾），终点离文件结尾 ≤5 秒的标「到结尾」，客户端直接给「下一集」。
 
@@ -62,8 +70,16 @@ MAJORITY = 0.5
 MERGE_GAP_S = 3.0
 #: 片尾终点离文件结尾多近算「到结尾」（秒）
 TO_END_S = 5.0
+#: 片头窗里短段的最短长度（秒）：平台厂标、发行许可证、冠名广告多在 6～15 秒
+SHORT_SEGMENT_S = 6.0
+#: 短候选「对得很像」的门槛：比长段的 GOOD_MATCH 严，剧情配乐的零碎重复多在 0.7～0.8
+SHORT_GOOD_MATCH = 0.85
+#: 短段可以独立成立的开头区（文件秒）：厂标、许可证、冠名广告都在这里
+HEAD_ZONE_S = 60.0
+#: 开头区以外的短段必须离一个已接受的长段多近（秒）：片头后紧跟的冠名广告
+ADJACENT_S = 3.0
 #: 算法版本：改了上面任何规则就加一，服务端据此把旧结果全部重算一遍
-ALGO_VERSION = 5
+ALGO_VERSION = 6
 
 _POPCOUNT8 = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
 
@@ -127,7 +143,9 @@ class Segment:
 # ---------------------------------------------------------------------------
 
 
-def _contiguous(lhs: np.ndarray, rhs: np.ndarray, shift: int) -> list[tuple[int, int, int, int]]:
+def _contiguous(
+    lhs: np.ndarray, rhs: np.ndarray, shift: int, min_s: float = MIN_SEGMENT_S
+) -> list[tuple[int, int, int, int]]:
     """在给定位移下找全部连续相似区间，返回 (lhs 起, lhs 止, rhs 起, rhs 止) 帧号。
 
     ``shift`` = rhs 帧号 - lhs 帧号。相似 = 汉明距离 ≤ MAX_BIT_DIFF；断点 ≤ MAX_GAP_S 不打断。
@@ -149,7 +167,7 @@ def _contiguous(lhs: np.ndarray, rhs: np.ndarray, shift: int) -> list[tuple[int,
     regions = []
     for first, last in zip(starts, ends, strict=True):
         a, b = int(idx[first]) + lo, int(idx[last]) + lo
-        if (b - a) * HASH_SECONDS >= MIN_SEGMENT_S:
+        if (b - a) * HASH_SECONDS >= min_s:
             regions.append((a, b, a + shift, b + shift))
     return regions
 
@@ -168,9 +186,11 @@ def _candidate_shifts(lhs: np.ndarray, rhs: np.ndarray) -> set[int]:
     return shifts
 
 
-def shared_regions(lhs: np.ndarray, rhs: np.ndarray) -> list[tuple[int, int, int, int]]:
-    """两段指纹之间互不重叠的全部共享段（帧号），长的优先。"""
-    found = [r for s in _candidate_shifts(lhs, rhs) for r in _contiguous(lhs, rhs, s)]
+def shared_regions(
+    lhs: np.ndarray, rhs: np.ndarray, min_s: float = MIN_SEGMENT_S
+) -> list[tuple[int, int, int, int]]:
+    """两段指纹之间互不重叠的、至少 ``min_s`` 秒的全部共享段（帧号），长的优先。"""
+    found = [r for s in _candidate_shifts(lhs, rhs) for r in _contiguous(lhs, rhs, s, min_s)]
     found.sort(key=lambda r: -(r[1] - r[0]))
     kept: list[tuple[int, int, int, int]] = []
     for r in found:
@@ -216,7 +236,9 @@ class _Season:
             return []
         mine: list[tuple[tuple[float, float], float]] = []
         theirs: list[tuple[tuple[float, float], float]] = []
-        for region in shared_regions(wa.hashes, wb.hashes):
+        # 片头窗放宽到短段（厂标、许可证、冠名广告），由 raw_segments 再加约束；片尾窗不变
+        min_s = SHORT_SEGMENT_S if mode == "intro" else MIN_SEGMENT_S
+        for region in shared_regions(wa.hashes, wb.hashes, min_s):
             sa, ea = region[0] * HASH_SECONDS, region[1] * HASH_SECONDS
             if ea - sa > MAX_SEGMENT_S[mode]:
                 continue
@@ -267,12 +289,21 @@ class _Season:
         candidates = sorted({r for regs in per for r, _ in regs}, key=lambda r: -(r[1] - r[0]))
         accepted: list[tuple[float, float, int]] = []
         for r in candidates:
+            short = r[1] - r[0] < MIN_SEGMENT_S
             support: list[tuple[tuple[float, float], float]] = []
             for regs in per:
-                hits = [(x, q) for x, q in regs if _overlap(r, x) >= 0.5 * (r[1] - r[0])]
+                # 长候选只认长匹配的票：片头窗放宽到短段后，伙伴里零碎的短重复（剧情
+                # 配乐的一小截）不能把原本票数不够的长候选抬过门槛。《无证之罪》E08
+                # 28–44 秒的剧情就是靠一段 11 秒短匹配凑够了第二票。
+                hits = [
+                    (x, q)
+                    for x, q in regs
+                    if _overlap(r, x) >= 0.5 * (r[1] - r[0])
+                    and (short or x[1] - x[0] >= MIN_SEGMENT_S)
+                ]
                 if hits:
                     support.append(max(hits, key=lambda h: _overlap(r, h[0])))
-            good = [x for x, q in support if q >= GOOD_MATCH]
+            good = [x for x, q in support if q >= (SHORT_GOOD_MATCH if short else GOOD_MATCH)]
             if len(good) >= 2:
                 used = good
             elif len(support) >= 2 and len(support) >= MAJORITY * len(partners):
@@ -286,6 +317,19 @@ class _Season:
             s = float(np.median([x[0] for x in used]))
             e = float(np.median([x[1] for x in used]))
             if any(_overlap((s, e), (a, b)) > 0.5 * min(e - s, b - a) for a, b, _ in accepted):
+                continue
+            # 开头区以外的短段必须紧挨一个已接受的长段（候选按长度从长到短处理，长段
+            # 已经都在 accepted 里）。片头后的冠名广告满足；片中零碎的配乐重复一般不贴着
+            # 片头，全窗放宽实测有三分之一是剧情。
+            if (
+                short
+                and s >= HEAD_ZONE_S
+                and not any(
+                    b - a >= MIN_SEGMENT_S
+                    and (abs(s - b) <= ADJACENT_S or abs(a - e) <= ADJACENT_S)
+                    for a, b, _ in accepted
+                )
+            ):
                 continue
             accepted.append((s, e, len(support)))
         return sorted(accepted)
